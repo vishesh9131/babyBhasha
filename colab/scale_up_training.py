@@ -222,6 +222,8 @@ def main():
                        help='Path to source checkpoint to transfer from')
     parser.add_argument('--source-dataset', type=str, default='custom',
                        help='Dataset used for source model (for tokenizer loading)')
+    parser.add_argument('--train-from-scratch', action='store_true',
+                       help='Train from scratch instead of transfer learning (ignores source checkpoint)')
     
     # New model configuration
     parser.add_argument('--d-model', type=int, default=768, 
@@ -240,6 +242,8 @@ def main():
                        help='Text column for parquet files')
     parser.add_argument('--drop-first-column', action='store_true',
                        help='Drop the first column from parquet files before processing')
+    parser.add_argument('--force-tpu', action='store_true',
+                       help='Force TPU usage, bypass TPU detection (useful in Colab)')
     parser.add_argument('--epochs', type=int, default=15,
                        help='Additional epochs to train')
     parser.add_argument('--batch-size', type=int, default=8,
@@ -260,26 +264,38 @@ def main():
     print("🔄 Mamba Model Scale-Up Training")
     print("=" * 50)
     
-    # Check source checkpoint
-    if not os.path.exists(args.source_checkpoint):
-        print(f"❌ Source checkpoint not found: {args.source_checkpoint}")
-        return
+    # Initialize variables for source model info
+    source_model = None
+    source_args = None
+    source_params = 0
     
-    print(f"📂 Source checkpoint: {args.source_checkpoint}")
-    
-    # Load source model to get configuration
-    try:
-        source_lightning = MambaLightningModule.load_from_checkpoint(args.source_checkpoint)
-        source_model = source_lightning.model
-        source_args = source_model.args
+    # Handle source checkpoint loading or training from scratch
+    if args.train_from_scratch:
+        print("🆕 Training from scratch (no transfer learning)")
+        print(f"📂 Target model: {args.d_model}D, {args.n_layer}L")
+    else:
+        # Check source checkpoint
+        if not os.path.exists(args.source_checkpoint):
+            print(f"❌ Source checkpoint not found: {args.source_checkpoint}")
+            print("💡 Consider using --train-from-scratch to train without transfer learning")
+            return
         
-        print(f"📊 Source model: {source_args.d_model}D, {source_args.n_layer}L")
-        source_params = sum(p.numel() for p in source_model.parameters())
-        print(f"   Parameters: {source_params/1e6:.1f}M")
+        print(f"📂 Source checkpoint: {args.source_checkpoint}")
         
-    except Exception as e:
-        print(f"❌ Error loading source model: {e}")
-        return
+        # Load source model to get configuration
+        try:
+            source_lightning = MambaLightningModule.load_from_checkpoint(args.source_checkpoint)
+            source_model = source_lightning.model
+            source_args = source_model.args
+            
+            print(f"📊 Source model: {source_args.d_model}D, {source_args.n_layer}L")
+            source_params = sum(p.numel() for p in source_model.parameters())
+            print(f"   Parameters: {source_params/1e6:.1f}M")
+            
+        except Exception as e:
+            print(f"❌ Error loading source model: {e}")
+            print("💡 Consider using --train-from-scratch to train without transfer learning")
+            return
     
     # Setup data module with column dropping option
     data_module = FlexibleDataModuleWithColumnDrop(
@@ -320,17 +336,30 @@ def main():
     # Create new model
     new_model = Mamba(new_model_args)
     new_params = sum(p.numel() for p in new_model.parameters())
-    print(f"   Parameters: {new_params/1e6:.1f}M ({new_params/source_params:.1f}x larger)")
     
-    # Transfer compatible weights
-    print(f"\n🔄 Transferring weights from source model...")
-    transferred, skipped = transfer_compatible_weights(source_model, new_model)
+    if args.train_from_scratch:
+        print(f"   Parameters: {new_params/1e6:.1f}M (training from scratch)")
+        print(f"\n🆕 Initializing new model with random weights...")
+        transferred, skipped = [], list(new_model.state_dict().keys())
+        print(f"✅ Model initialized with {len(skipped)} randomly initialized layers")
+    else:
+        print(f"   Parameters: {new_params/1e6:.1f}M ({new_params/source_params:.1f}x larger)")
+        
+        # Transfer compatible weights
+        print(f"\n🔄 Transferring weights from source model...")
+        transferred, skipped = transfer_compatible_weights(source_model, new_model)
     
-    # Create new Lightning module with custom learning rate
-    new_lightning_module = ScaledMambaLightningModule(new_model_args, learning_rate=args.lr)
+    # Create new Lightning module with appropriate learning rate
+    # Use higher learning rate for training from scratch
+    if args.train_from_scratch:
+        learning_rate = args.lr if args.lr != 5e-4 else 1e-3  # Default to 1e-3 for from scratch
+        print(f"📈 Learning rate set to: {learning_rate} (training from scratch)")
+    else:
+        learning_rate = args.lr  # Use provided LR (default 5e-4 for fine-tuning)
+        print(f"📈 Learning rate set to: {learning_rate} (fine-tuning)")
+    
+    new_lightning_module = ScaledMambaLightningModule(new_model_args, learning_rate=learning_rate)
     new_lightning_module.model = new_model
-    
-    print(f"📈 Learning rate set to: {args.lr} (fine-tuning)")
     
     # Setup training
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -343,12 +372,65 @@ def main():
     )
     
     # Configure trainer with TPU-safe settings
-    try:
-        import torch_xla
+    def check_tpu_availability():
+        """Check if TPU is actually available and accessible, not just importable."""
+        try:
+            import torch_xla
+            print("✅ torch_xla imported successfully")
+            
+            try:
+                import torch_xla.core.xla_model as xm
+                print("✅ torch_xla.core.xla_model imported successfully")
+                
+                # Try to get TPU devices - but be more lenient
+                try:
+                    devices = xm.get_xla_supported_devices()
+                    print(f"🔍 XLA supported devices: {devices}")
+                    
+                    if devices:
+                        tpu_devices = [d for d in devices if 'TPU' in str(d)]
+                        print(f"🔍 TPU devices found: {tpu_devices}")
+                        if tpu_devices:
+                            return True
+                        else:
+                            print("⚠️  No TPU devices in XLA supported devices")
+                            # In Colab, sometimes TPU is available but not showing in devices
+                            # Let's be more lenient and check environment
+                            if 'COLAB_TPU_ADDR' in os.environ or 'TPU_NAME' in os.environ:
+                                print("🔍 TPU environment variables detected, assuming TPU is available")
+                                return True
+                            return False
+                    else:
+                        print("⚠️  No XLA devices found")
+                        # Still check environment variables
+                        if 'COLAB_TPU_ADDR' in os.environ or 'TPU_NAME' in os.environ:
+                            print("🔍 TPU environment variables detected, assuming TPU is available")
+                            return True
+                        return False
+                        
+                except Exception as device_error:
+                    print(f"⚠️  Error getting XLA devices: {device_error}")
+                    # Fallback to environment check
+                    if 'COLAB_TPU_ADDR' in os.environ or 'TPU_NAME' in os.environ:
+                        print("🔍 TPU environment variables detected, assuming TPU is available")
+                        return True
+                    return False
+                    
+            except Exception as xm_error:
+                print(f"⚠️  Error importing xla_model: {xm_error}")
+                return False
+                
+        except Exception as e:
+            print(f"⚠️  TPU check failed: {e}")
+            return False
+
+    is_tpu = check_tpu_availability()
+
+    # Override TPU detection if force flag is set
+    if args.force_tpu:
+        print("🔧 Force TPU flag set - bypassing TPU detection")
         is_tpu = True
-    except ImportError:
-        is_tpu = False
-    
+
     trainer_args = {
         'max_epochs': args.epochs,
         'callbacks': [checkpoint_callback],
@@ -356,29 +438,80 @@ def main():
         'enable_progress_bar': True,
         'log_every_n_steps': 50,
     }
-    
+
     if is_tpu:
+        print("🔥 Using TPU acceleration")
         trainer_args.update({
             'accelerator': 'tpu',
             'devices': 'auto',
             'precision': 32,
         })
     else:
-        trainer_args.update({
-            'accelerator': 'auto',
-            'devices': 'auto',
-            'precision': '16-mixed' if torch.cuda.is_available() else 32,
-        })
-    
+        if torch.cuda.is_available():
+            print("🚀 Using GPU acceleration")
+            trainer_args.update({
+                'accelerator': 'gpu',
+                'devices': 'auto',
+                'precision': '16-mixed',
+            })
+        else:
+            print("💻 Using CPU (no accelerator available)")
+            trainer_args.update({
+                'accelerator': 'cpu',
+                'devices': 'auto',
+                'precision': 32,
+            })
+
     trainer = pl.Trainer(**trainer_args)
-    
-    # Start training
-    print(f"\n🚀 Starting scaled training...")
-    print(f"   Source: {source_params/1e6:.1f}M params -> Target: {new_params/1e6:.1f}M params")
-    print(f"   Additional epochs: {args.epochs}")
-    print(f"   Drop first column: {args.drop_first_column}")
-    
-    trainer.fit(new_lightning_module, data_module)
+
+    # Start training with fallback mechanism
+    if args.train_from_scratch:
+        print(f"\n🚀 Starting training from scratch...")
+        print(f"   Model: {new_params/1e6:.1f}M params ({args.d_model}D, {args.n_layer}L)")
+        print(f"   Training epochs: {args.epochs}")
+        print(f"   Drop first column: {args.drop_first_column}")
+    else:
+        print(f"\n🚀 Starting scaled training...")
+        print(f"   Source: {source_params/1e6:.1f}M params -> Target: {new_params/1e6:.1f}M params")
+        print(f"   Additional epochs: {args.epochs}")
+        print(f"   Drop first column: {args.drop_first_column}")
+
+    try:
+        trainer.fit(new_lightning_module, data_module)
+    except Exception as e:
+        if "TPU" in str(e) or "xla" in str(e).lower() or "accel" in str(e):
+            print(f"\n⚠️  TPU training failed: {e}")
+            print("🔄 Falling back to GPU/CPU training...")
+            
+            # Create new trainer with CPU/GPU fallback
+            fallback_trainer_args = {
+                'max_epochs': args.epochs,
+                'callbacks': [checkpoint_callback],
+                'default_root_dir': 'logs_scaled',
+                'enable_progress_bar': True,
+                'log_every_n_steps': 50,
+            }
+            
+            if torch.cuda.is_available():
+                print("🚀 Using GPU acceleration (fallback)")
+                fallback_trainer_args.update({
+                    'accelerator': 'gpu',
+                    'devices': 'auto',
+                    'precision': '16-mixed',
+                })
+            else:
+                print("💻 Using CPU (fallback)")
+                fallback_trainer_args.update({
+                    'accelerator': 'cpu',
+                    'devices': 'auto',
+                    'precision': 32,
+                })
+            
+            trainer = pl.Trainer(**fallback_trainer_args)
+            trainer.fit(new_lightning_module, data_module)
+        else:
+            # Re-raise non-TPU related errors
+            raise e
     
     # Save final model
     final_checkpoint = f"mamba_{args.output_name}_final.ckpt"
@@ -398,11 +531,16 @@ def main():
     print(f"✅ Decoder saved as: {decode_file}")
     
     # Print summary
-    print(f"\n📊 Scale-up Training Completed!")
-    print(f"   Original: {source_params/1e6:.1f}M params")
-    print(f"   Scaled:   {new_params/1e6:.1f}M params ({new_params/source_params:.1f}x)")
-    print(f"   Transferred layers: {len(transferred)}")
-    print(f"   New/expanded layers: {len(skipped)}")
+    print(f"\n📊 Training Completed!")
+    if args.train_from_scratch:
+        print(f"   Model:     {new_params/1e6:.1f}M params ({args.d_model}D, {args.n_layer}L)")
+        print(f"   Training:  From scratch ({args.epochs} epochs)")
+        print(f"   Layers:    {len(skipped)} randomly initialized")
+    else:
+        print(f"   Original:  {source_params/1e6:.1f}M params")
+        print(f"   Scaled:    {new_params/1e6:.1f}M params ({new_params/source_params:.1f}x)")
+        print(f"   Transferred layers: {len(transferred)}")
+        print(f"   New/expanded layers: {len(skipped)}")
     print(f"   Vocabulary: {data_module.vocab_size}")
 
 if __name__ == '__main__':
