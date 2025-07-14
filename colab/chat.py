@@ -4,8 +4,23 @@ import sys
 import os
 from typing import Optional
 
-sys.path.append('.')
-from model import Mamba, ModelArgs
+# Handle different environments (local vs Colab)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+
+# Add paths for local development
+sys.path.append(current_dir)
+sys.path.append(parent_dir)
+sys.path.append(os.path.join(current_dir, 'mamba_tiny_master'))
+
+# Add paths for Colab environment
+if '/content' in os.getcwd():
+    sys.path.append('/content')
+    sys.path.append('/content/babyBhasha')
+    sys.path.append('/content/babyBhasha/colab')
+    sys.path.append('/content/babyBhasha/colab/mamba_tiny_master')
+
+from mamba_tiny_master.model import Mamba, ModelArgs
 from train import MambaLightningModule
 
 class MambaChat:
